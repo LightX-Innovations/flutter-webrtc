@@ -110,11 +110,25 @@
         pixelBufferRef = [FlutterRTCFrameCapturer convertToCVPixelBuffer:frame];
         shouldRelease = true;
     }
-    CMVideoFormatDescriptionRef formatDescription;
+    // Both objects below follow the Create rule and must be released. Leaking
+    // the sample buffer keeps the camera's pixel buffer alive, which drains the
+    // capture pool within a few 4K frames and freezes the track for every
+    // consumer (local preview and the published WebRTC stream) (APP-8150).
+    CMVideoFormatDescriptionRef formatDescription = NULL;
     OSStatus status = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBufferRef, &formatDescription);
+    if (status != noErr || formatDescription == NULL) {
+        NSLog(@"Drop frame, no format description (%d)", (int)status);
+        #if TARGET_OS_IPHONE
+        if (shouldRelease) {
+            CVPixelBufferRelease(pixelBufferRef);
+        }
+        #endif
+        return;
+    }
 
     CMSampleTimingInfo timingInfo;
     
+    timingInfo.duration = kCMTimeInvalid;
     timingInfo.decodeTimeStamp = kCMTimeInvalid;
     if (_startTime == -1) {
         _startTime = frame.timeStampNs / 1000;
@@ -123,7 +137,7 @@
     timingInfo.presentationTimeStamp = CMTimeMake(frameTime, 1000000);
     framesCount++;
 
-    CMSampleBufferRef outBuffer;
+    CMSampleBufferRef outBuffer = NULL;
 
     status = CMSampleBufferCreateReadyWithImageBuffer(
         kCFAllocatorDefault,
@@ -132,9 +146,15 @@
         &timingInfo,
         &outBuffer
     );
+    CFRelease(formatDescription);
 
-    if (![self.writerInput appendSampleBuffer:outBuffer]) {
-        NSLog(@"Frame not appended %@", self.assetWriter.error);
+    if (status == noErr && outBuffer != NULL) {
+        if (![self.writerInput appendSampleBuffer:outBuffer]) {
+            NSLog(@"Frame not appended %@", self.assetWriter.error);
+        }
+        CFRelease(outBuffer);
+    } else {
+        NSLog(@"Drop frame, no sample buffer (%d)", (int)status);
     }
     #if TARGET_OS_IPHONE
     if (shouldRelease) {
